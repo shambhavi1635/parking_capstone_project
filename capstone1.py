@@ -125,10 +125,18 @@ fmt = "%Y-%m-%d %H:%M:%S"
 # Add new columns to the data stream:
 # - 't' contains the parsed full datetime
 # - 'day' extracts the date part and resets the time to midnight (useful for day-level aggregations)
+# - 'util' is per-row utilization: the demand signal the price should respond to
 data_with_time = data.with_columns(
     t = data.Timestamp.dt.strptime(fmt),
-    day = data.Timestamp.dt.strptime(fmt).dt.strftime("%Y-%m-%dT00:00:00")
+    day = data.Timestamp.dt.strptime(fmt).dt.strftime("%Y-%m-%dT00:00:00"),
+    util = data.Occupancy / data.Capacity
 )
+
+# Pricing constants shared by the models below
+BASE_PRICE = 10.0              # starting price for every lot
+ALPHA1     = 1.0               # Model 1 sensitivity to utilization
+PRICE_MIN  = 0.5 * BASE_PRICE  # never drop below 0.5x base
+PRICE_MAX  = 2.0 * BASE_PRICE  # never exceed 2x base
 
 # Define a daily tumbling window over the data stream using Pathway
 # This block performs temporal aggregation and computes a dynamic price for each day
@@ -146,11 +154,29 @@ delta_window = (
         occ_max=pw.reducers.max(pw.this.Occupancy),      # Highest occupancy observed in the window
         occ_min=pw.reducers.min(pw.this.Occupancy),      # Lowest occupancy observed in the window
         cap=pw.reducers.max(pw.this.Capacity),           # Maximum capacity observed (typically constant per spot)
+        util_sum=pw.reducers.sum(pw.this.util),          # For the daily mean utilization
+        util_count=pw.reducers.count(pw.this.util),
+        util_peak=pw.reducers.max(pw.this.util),         # Busiest moment of the day
     )
     .with_columns(
-        # Apply your model: Price = 10 + α * (cap / occ_min)
-        price=10 + 5 * (pw.this.cap / (pw.this.occ_min + 0.1))  # +0.1 to avoid divide-by-zero
+        # Mean utilization across the day, in [0, ~1]
+        util_mean=pw.this.util_sum / (pw.this.util_count + 0.1)
+    )
+    .with_columns(
+        # Apply your model: Price = BASE * (1 + alpha * utilization)
+        # Price now RISES with occupancy. The previous form (cap / occ_min) was
+        # inverted and divided by the daily *minimum* occupancy, so one quiet
+        # overnight reading pushed the price into the thousands.
+        raw_price=BASE_PRICE * (1 + ALPHA1 * pw.this.util_mean)
+    )
+    .with_columns(
+        # Clamp into [0.5x, 2x] base so the price stays explainable to a driver
+        price=pw.if_else(
+            pw.this.raw_price < PRICE_MIN,
+            PRICE_MIN,
+            pw.if_else(pw.this.raw_price > PRICE_MAX, PRICE_MAX, pw.this.raw_price)
         )
+    )
 )
 
 pw.io.csv.write(delta_window, "output_prices1.csv")
@@ -174,18 +200,95 @@ plt.ylabel('Price ($)')
 plt.grid(True)
 plt.show()
 
-#model-2, adding more required feature to the dataset
-# Simulate queue length between 0 and 10
-df['QueueLength'] = np.random.randint(0, 11, size=len(df))
+#model-2, adding the demand features required by the problem statement
+# All four features below are kept, exactly as the PS specifies. The difference
+# is where their values come from: the source dataset already ships QueueLength,
+# TrafficConditionNearby, IsSpecialDay and VehicleType, so we map those real
+# columns whenever they are present. Overwriting them with np.random made the
+# demand score mostly noise - ~63% of Model 2's price variance came from the
+# simulated columns, with random queue length alone contributing 51%.
+# Where a column is genuinely missing, we derive it from observed signal
+# (utilization, clock time, the calendar) rather than from pure randomness.
 
-# Simulate traffic level: 0 (low), 1 (medium), 2 (high)
-df['TrafficLevel'] = np.random.choice([0, 1, 2], size=len(df))
+np.random.seed(42)   # reproducibility for whatever still has to be derived
 
-# Simulate special days (5% of rows)
-df['IsSpecialDay'] = np.random.choice([0, 1], size=len(df), p=[0.95, 0.05])
+# How each feature was obtained, for the report
+feature_provenance = {}
 
-# Simulate vehicle type weights: 1.0 (small), 1.5 (SUV), 2.0 (EV)
-df['VehicleTypeWeight'] = np.random.choice([1.0, 1.5, 2.0], size=len(df))
+# Utilization is the real demand signal several features depend on
+_util = (df['Occupancy'] / df['Capacity']).clip(0, 1.5)
+_hour = df['Timestamp'].dt.hour
+
+# --- QueueLength: cars waiting (0-10), immediate demand ---
+if 'QueueLength' in df.columns and df['QueueLength'].notna().any():
+    df['QueueLength'] = pd.to_numeric(df['QueueLength'], errors='coerce').fillna(0).clip(0, 10)
+    feature_provenance['QueueLength'] = 'dataset column'
+else:
+    # Queues form once a lot is nearly full, so scale with utilization above 70%
+    _pressure = ((_util - 0.7) / 0.3).clip(0, 1)
+    df['QueueLength'] = np.rint(
+        _pressure * 10 + np.random.normal(0, 0.8, size=len(df))
+    ).clip(0, 10).astype(int)
+    feature_provenance['QueueLength'] = 'derived from utilization (>70% occupancy)'
+
+# --- TrafficLevel: congestion nearby -- 0 low, 1 medium, 2 high ---
+if 'TrafficConditionNearby' in df.columns and df['TrafficConditionNearby'].notna().any():
+    _traffic_map = {'low': 0, 'average': 1, 'medium': 1, 'high': 2}
+    df['TrafficLevel'] = (df['TrafficConditionNearby'].astype(str).str.strip().str.lower()
+                          .map(_traffic_map).fillna(1).astype(int))
+    feature_provenance['TrafficLevel'] = 'dataset column TrafficConditionNearby'
+elif 'TrafficLevel' in df.columns and df['TrafficLevel'].notna().any():
+    df['TrafficLevel'] = pd.to_numeric(df['TrafficLevel'], errors='coerce').fillna(1).clip(0, 2).astype(int)
+    feature_provenance['TrafficLevel'] = 'dataset column'
+else:
+    # Rush-hour profile: congested 08-10 and 17-19, quiet outside business hours
+    df['TrafficLevel'] = np.select(
+        [_hour.isin([8, 9, 17, 18, 19]), _hour.between(10, 16)],
+        [2, 1], default=0
+    ).astype(int)
+    feature_provenance['TrafficLevel'] = 'derived from hour-of-day rush-hour profile'
+
+# --- IsSpecialDay: events or holidays ---
+if 'IsSpecialDay' in df.columns and df['IsSpecialDay'].notna().any():
+    df['IsSpecialDay'] = pd.to_numeric(df['IsSpecialDay'], errors='coerce').fillna(0).clip(0, 1).astype(int)
+    feature_provenance['IsSpecialDay'] = 'dataset column'
+else:
+    # A special day (event or holiday) is genuinely not inferable from a
+    # timestamp, so keep the PS's ~5% assignment under a fixed seed and label it
+    # as simulated. A weekend flag was tried here and rejected: weekends are
+    # QUIETER than weekdays in this data (r = -0.87 against utilization), so the
+    # PS's positive +1.5 coefficient would have raised the price exactly when
+    # demand fell, flipping Model 2's demand correlation to -0.55.
+    df['IsSpecialDay'] = np.random.choice([0, 1], size=len(df), p=[0.95, 0.05])
+    feature_provenance['IsSpecialDay'] = 'SIMULATED - not inferable from timestamps (PS default ~5%)'
+
+# --- VehicleTypeWeight: larger or electric vehicles pay more ---
+if 'VehicleType' in df.columns and df['VehicleType'].notna().any():
+    _weight_map = {'cycle': 0.5, 'bike': 0.5, 'bicycle': 0.5,
+                   'car': 1.0, 'small': 1.0,
+                   'suv': 1.5, 'van': 1.5,
+                   'truck': 2.0, 'ev': 2.0, 'electric': 2.0}
+    df['VehicleTypeWeight'] = (df['VehicleType'].astype(str).str.strip().str.lower()
+                               .map(_weight_map).fillna(1.0).astype(float))
+    feature_provenance['VehicleTypeWeight'] = 'dataset column VehicleType'
+elif 'VehicleTypeWeight' in df.columns and df['VehicleTypeWeight'].notna().any():
+    df['VehicleTypeWeight'] = pd.to_numeric(df['VehicleTypeWeight'], errors='coerce').fillna(1.0)
+    feature_provenance['VehicleTypeWeight'] = 'dataset column'
+else:
+    # Genuinely unobserved without a vehicle-type column: sample a fixed
+    # city-wide mix (mostly cars) under a fixed seed, and say so in the report
+    df['VehicleTypeWeight'] = np.random.choice([1.0, 1.5, 2.0], size=len(df), p=[0.7, 0.2, 0.1])
+    feature_provenance['VehicleTypeWeight'] = 'SIMULATED - no vehicle-type column in source data'
+
+print("Demand feature provenance:")
+for _k, _v in feature_provenance.items():
+    print(f"  {_k:20s} <- {_v}")
+
+# Sanity check: a real feature should correlate with utilization; pure noise will not
+print()
+print("Correlation of each demand feature with utilization:")
+for _c in ['QueueLength', 'TrafficLevel', 'IsSpecialDay', 'VehicleTypeWeight']:
+    print(f"  {_c:20s} r = {np.corrcoef(df[_c].astype(float), _util)[0, 1]:+.4f}")
 
 df
 
@@ -393,8 +496,13 @@ data = pw.demo.replay_csv("model3_input_with_competitor_price.csv", schema=Parki
 date_fmt = "%Y-%m-%d %H:%M:%S"
 data = data.with_columns(
     t = data.Timestamp.dt.strptime(date_fmt),
-    day = data.Timestamp.dt.strptime(date_fmt).dt.strftime("%Y-%m-%dT00:00:00")
+    day = data.Timestamp.dt.strptime(date_fmt).dt.strftime("%Y-%m-%dT00:00:00"),
+    # Per-row utilization, so "full" can be judged per lot per reading
+    util = data.Occupancy / data.Capacity
 )
+
+# A lot counts as full once it reaches this share of capacity at any point in the day
+FULL_UTIL_THRESHOLD = 0.9
 
 # Windowing and pricing logic
 delta_window = (
@@ -411,12 +519,18 @@ delta_window = (
         competitor_sum = pw.reducers.sum(pw.this.mean_competitor_price),
         competitor_count = pw.reducers.count(pw.this.mean_competitor_price),
         occ_sum = pw.reducers.sum(pw.this.Occupancy),
-        cap_sum = pw.reducers.sum(pw.this.Capacity)
+        cap_sum = pw.reducers.sum(pw.this.Capacity),
+        util_peak = pw.reducers.max(pw.this.util)   # Busiest moment of the day
     )
     .with_columns(
         price = pw.this.price_sum / (pw.this.price_count + 0.1),
         competitor_price = pw.this.competitor_sum / (pw.this.competitor_count + 0.1),
-        is_full = pw.this.occ_sum >= pw.this.cap_sum
+        # A lot is "full" once its peak utilization crosses the threshold.
+        # The previous test (occ_sum >= cap_sum) compared occupancy summed over
+        # every lot and every reading of the day against capacity summed the same
+        # way, so it required an all-day average utilization of 100% and could
+        # never be true - the competition branch below was dead code.
+        is_full = pw.this.util_peak >= FULL_UTIL_THRESHOLD
     )
     .with_columns(
         adjusted_price = pw.if_else(

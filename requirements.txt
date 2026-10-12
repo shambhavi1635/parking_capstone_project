@@ -1,0 +1,14 @@
+# Dependencies for capstone1.py / pipeline.py / forecast_price.py
+# (Dynamic Pricing for Urban Parking Lots)
+numpy
+pandas
+matplotlib
+scikit-learn
+pathway
+bokeh
+panel
+geopy
+ipython
+
+# Note: capstone1.py also uses `google.colab` (files upload/download), which is
+# only available inside Google Colab and cannot be installed via pip.
